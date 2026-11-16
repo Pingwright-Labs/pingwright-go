@@ -16,7 +16,11 @@
 //	if err != nil {
 //		log.Fatal(err)
 //	}
-//	defer shutdown(context.Background())
+//	defer func() {
+//		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//		defer cancel()
+//		_ = shutdown(ctx)
+//	}()
 //
 //	slog.Info("started") // goes to stderr and to Pingwright
 //
@@ -24,6 +28,11 @@
 // warning and runs in local mode: logging, [CaptureError], [Recover] and
 // [Middleware] keep working, and nothing is sent. This keeps development
 // setups and tests free of configuration.
+//
+// The library never panics in your code and never blocks it on the network:
+// records are batched and exported in the background, export failures are
+// written (rate-limited) to the local output only, and shutdown returns by
+// the context's deadline, or after 5 seconds if the context has none.
 //
 // Pingwright does not store traces, so none are exported. Trace and span ids
 // from the context (set by your own tracer, or by [Middleware] from an
@@ -36,14 +45,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
@@ -70,23 +80,26 @@ const DefaultEndpoint = "https://ingest.pingwright.app"
 const LevelFatal = slog.LevelError + 4
 
 const (
-	scopeName      = "github.com/Pingwright-Labs/pingwright-go"
-	exportTimeout  = 10 * time.Second
-	metricInterval = 30 * time.Second
-	panicFlush     = 5 * time.Second
+	scopeName       = "github.com/Pingwright-Labs/pingwright-go"
+	exportTimeout   = 10 * time.Second
+	metricInterval  = 30 * time.Second
+	panicFlush      = 5 * time.Second
+	shutdownTimeout = 5 * time.Second
+	maxKeyLen       = 256
 )
 
 // ErrAlreadyInitialized is returned by a second [Init] before the first one's
 // shutdown function has run.
 var ErrAlreadyInitialized = errors.New("pingwright: already initialized")
 
-var keyPattern = regexp.MustCompile(`^pwi_[0-9a-f]{32}$`)
-
 // Options configures [Init]. The zero value is valid: it reads the key from
 // PINGWRIGHT_KEY and sends logs at Info and above, errors and metrics.
 type Options struct {
-	// Key is the ingest key, "pwi_" followed by 32 hex characters.
-	// Falls back to PINGWRIGHT_KEY. With neither, Init runs in local mode.
+	// Key is the ingest key, starting with "pwi_". Falls back to
+	// PINGWRIGHT_KEY. With neither, Init runs in local mode. Surrounding
+	// whitespace is trimmed; a key that is blank or contains whitespace or
+	// control characters makes Init fail. A key of any other unexpected
+	// shape gets one local warning, and the server decides.
 	Key string
 
 	// Service is service.name. Falls back to OTEL_SERVICE_NAME, then to the
@@ -108,8 +121,9 @@ type Options struct {
 	DisableLogs bool
 
 	// DisableErrors stops CaptureError, Recover and Middleware from sending
-	// exception records. They still log locally (and, with logs on, send a
-	// plain error log without exception attributes, so no issue is made).
+	// exception records. They still log locally, with the stack (and, with
+	// logs on, send a plain error log without exception attributes, so no
+	// issue is made).
 	DisableErrors bool
 
 	// DisableMetrics stops all metrics, including runtime and HTTP metrics.
@@ -119,16 +133,23 @@ type Options struct {
 	// goroutines) that are otherwise collected every 30 seconds.
 	DisableRuntimeMetrics bool
 
-	// LogLevel is the minimum level written locally and sent. The default
-	// (the zero value) is slog.LevelInfo. Errors are always sent.
-	LogLevel slog.Level
+	// LogLevel is the minimum level written locally and sent, for example
+	// slog.LevelDebug or a *slog.LevelVar to change it at run time. nil
+	// means slog.LevelInfo. Errors are always sent.
+	LogLevel slog.Leveler
 
 	// Output receives local log output. Defaults to os.Stderr. Use
-	// io.Discard to log to Pingwright only.
+	// io.Discard to log to Pingwright only. Ignored when Handler is set.
 	Output io.Writer
 
 	// TextOutput writes local output with slog's text format instead of JSON.
+	// Ignored when Handler is set.
 	TextOutput bool
+
+	// Handler, when set, receives local log output instead of the built-in
+	// JSON or text handler on Output. Its own level applies locally;
+	// LogLevel still decides what is sent.
+	Handler slog.Handler
 
 	// KeepDefaultLogger leaves slog.Default alone. By default Init calls
 	// slog.SetDefault(pingwright.Logger()), so slog.Info and the log package
@@ -142,11 +163,13 @@ type Options struct {
 }
 
 type client struct {
+	local      slog.Handler // local output only
 	handler    slog.Handler // Logger(): local + logs exporter
-	errHandler slog.Handler // CaptureError/Recover: local + logs exporter, no level filter
-	exceptions bool         // add exception.* attributes
+	errExport  slog.Handler // CaptureError/Recover export side; nil when nothing is sent
+	exceptions bool         // errExport gets exception.* attributes (else error.type only)
 	lp         *sdklog.LoggerProvider
 	mp         *sdkmetric.MeterProvider
+	prevEH     otel.ErrorHandler // restored on shutdown; nil when not replaced
 }
 
 var (
@@ -158,7 +181,8 @@ func noopShutdown(context.Context) error { return nil }
 
 // Init configures logs, metrics and errors for the process and returns a
 // function that flushes and stops them. Call it once at startup and defer
-// the returned function; it is safe to call more than once.
+// the returned function with a context that has a deadline (without one,
+// it gives up after 5 seconds); it is safe to call more than once.
 //
 // A second Init before shutdown returns ErrAlreadyInitialized. After
 // shutdown, Init may be called again. The returned shutdown function is
@@ -174,12 +198,12 @@ func Init(ctx context.Context, opts Options) (shutdown func(context.Context) err
 		return noopShutdown, ErrAlreadyInitialized
 	}
 
-	out := opts.Output
-	if out == nil {
-		out = os.Stderr
+	level := opts.LogLevel
+	if level == nil {
+		level = slog.LevelInfo
 	}
-	local := newLocalHandler(out, opts.LogLevel, opts.TextOutput)
-	c := &client{handler: local, errHandler: local, exceptions: true}
+	local := localHandler(opts, level)
+	c := &client{local: local, handler: local, exceptions: true}
 
 	key := firstNonEmpty(opts.Key, os.Getenv("PINGWRIGHT_KEY"))
 	if key == "" {
@@ -187,13 +211,24 @@ func Init(ctx context.Context, opts Options) (shutdown func(context.Context) err
 		slog.New(local).Warn("pingwright: no key (Options.Key or PINGWRIGHT_KEY); logs, metrics and errors stay local")
 		return c.shutdown, nil
 	}
-	if !keyPattern.MatchString(key) {
-		return noopShutdown, errors.New(`pingwright: the key must be "pwi_" followed by 32 lowercase hex characters`)
+	key, warning, err := checkKey(key)
+	if err != nil {
+		return noopShutdown, err
 	}
 
 	endpoint := strings.TrimRight(firstNonEmpty(opts.Endpoint, os.Getenv("PINGWRIGHT_ENDPOINT"), DefaultEndpoint), "/")
-	if u, err := url.Parse(endpoint); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return noopShutdown, fmt.Errorf("pingwright: invalid endpoint %q: want an http(s) URL", endpoint)
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return noopShutdown, errors.New("pingwright: invalid endpoint: want an http(s) URL")
+	}
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return noopShutdown, fmt.Errorf("pingwright: invalid endpoint %q: want an http(s) URL", u.Redacted())
+	}
+	if warning != "" {
+		slog.New(local).Warn(warning)
+	}
+	if u.Scheme == "http" && !isLoopback(u.Hostname()) {
+		slog.New(local).Warn("pingwright: the endpoint uses plain http to a non-local host; the key is sent unencrypted", "endpoint", u.Redacted())
 	}
 
 	res, err := newResource(ctx, opts)
@@ -214,16 +249,18 @@ func Init(ctx context.Context, opts Options) (shutdown func(context.Context) err
 		}
 		c.lp = sdklog.NewLoggerProvider(
 			sdklog.WithResource(res),
-			sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)),
+			sdklog.WithProcessor(sdklog.NewBatchProcessor(exp, sdklog.WithExportTimeout(exportTimeout))),
 		)
 		otlp := otelslog.NewHandler(scopeName, otelslog.WithLoggerProvider(c.lp), otelslog.WithVersion(Version))
+		var logs slog.Handler
 		if !opts.DisableLogs {
-			c.handler = slog.NewMultiHandler(local, minLevel{level: opts.LogLevel, Handler: otlp})
+			logs = minLevel{level: level, Handler: otlp}
+			c.handler = slog.NewMultiHandler(local, logs)
 		}
 		if !opts.DisableErrors {
-			c.errHandler = slog.NewMultiHandler(local, otlp)
+			c.errExport = otlp
 		} else {
-			c.errHandler = c.handler
+			c.errExport = logs // plain error logs, if logs are on
 			c.exceptions = false
 		}
 	}
@@ -255,8 +292,39 @@ func Init(ctx context.Context, opts Options) (shutdown func(context.Context) err
 		otel.SetMeterProvider(c.mp)
 	}
 
+	// Export failures go to the local output only: the default handler
+	// writes to the log package, which Init routes back into the exporter.
+	c.prevEH = otel.GetErrorHandler()
+	if c.prevEH != otelErrors {
+		otel.SetErrorHandler(otelErrors)
+	}
 	c.install(opts)
 	return c.shutdown, nil
+}
+
+// checkKey trims key and rejects one that can't be sent as a header value.
+// It returns a warning for a key of an unexpected shape, which is still
+// used: the server decides.
+func checkKey(key string) (string, string, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", "", errors.New("pingwright: the key is blank")
+	}
+	if strings.IndexFunc(key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return "", "", errors.New("pingwright: the key contains whitespace or control characters")
+	}
+	if !strings.HasPrefix(key, "pwi_") || len(key) > maxKeyLen {
+		return key, `pingwright: the key does not look like an ingest key ("pwi_..."); sending anyway`, nil
+	}
+	return key, "", nil
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (c *client) install(opts Options) {
@@ -266,38 +334,72 @@ func (c *client) install(opts Options) {
 	}
 }
 
-// shutdown flushes pending logs and metrics and stops the exporters. Later
-// calls return nil. After it, Logger writes to stderr only.
+// shutdown flushes pending logs and metrics and stops the exporters. It
+// returns by ctx's deadline, or after 5 seconds when ctx has none. Later
+// calls return nil. After it, Logger writes to the local output only.
 func (c *client) shutdown(ctx context.Context) error {
 	mu.Lock()
 	defer mu.Unlock()
-	if !current.CompareAndSwap(c, nil) {
+	if current.Load() != c {
 		return nil
 	}
-	return c.stop(ctx)
+	fallback.Store(&client{local: c.local, handler: c.local, exceptions: true})
+	current.Store(nil)
+	err := c.stop(ctx)
+	if c.prevEH != nil && c.prevEH != otelErrors && otel.GetErrorHandler() == otelErrors {
+		otel.SetErrorHandler(c.prevEH)
+	}
+	return err
 }
 
 func (c *client) stop(ctx context.Context) error {
-	var errs []error
+	var fns []func(context.Context) error
 	if c.lp != nil {
-		errs = append(errs, c.lp.Shutdown(ctx))
+		fns = append(fns, c.lp.Shutdown)
 	}
 	if c.mp != nil {
-		errs = append(errs, c.mp.Shutdown(ctx))
+		fns = append(fns, c.mp.Shutdown)
 	}
-	return errors.Join(errs...)
+	return runAll(ctx, fns...)
 }
 
 func (c *client) flush(ctx context.Context) {
-	if c == nil {
-		return
-	}
+	var fns []func(context.Context) error
 	if c.lp != nil {
-		_ = c.lp.ForceFlush(ctx)
+		fns = append(fns, c.lp.ForceFlush)
 	}
 	if c.mp != nil {
-		_ = c.mp.ForceFlush(ctx)
+		fns = append(fns, c.mp.ForceFlush)
 	}
+	_ = runAll(ctx, fns...)
+}
+
+// runAll runs fns concurrently and returns their joined errors, or ctx's
+// error once ctx is done, whichever comes first. Without a deadline on ctx,
+// it gives up after shutdownTimeout.
+func runAll(ctx context.Context, fns ...func(context.Context) error) error {
+	if len(fns) == 0 {
+		return nil
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, shutdownTimeout)
+		defer cancel()
+	}
+	errs := make(chan error, len(fns))
+	for _, fn := range fns {
+		go func() { errs <- fn(ctx) }()
+	}
+	var all []error
+	for range fns {
+		select {
+		case err := <-errs:
+			all = append(all, err)
+		case <-ctx.Done():
+			return errors.Join(append(all, ctx.Err())...)
+		}
+	}
+	return errors.Join(all...)
 }
 
 // Meter returns a meter from Pingwright's MeterProvider. Before Init, or with

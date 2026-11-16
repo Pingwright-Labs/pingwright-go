@@ -21,9 +21,12 @@ import (
 //     friends), with http.route taken from r.Pattern when next is an
 //     http.ServeMux (Go 1.22 patterns) or sits under one.
 //   - A panic in next is reported as an error event (ERROR, with the stack
-//     from the panicking frame and the request's method, path and route),
-//     answered with 500 if nothing was written yet, and not re-panicked, so
-//     the server keeps running. http.ErrAbortHandler passes through.
+//     from the panicking frame and the request's method, path and route).
+//     If nothing was written yet, the client gets a 500 and the panic stops
+//     there. If the response was already started, Middleware panics with
+//     http.ErrAbortHandler so net/http aborts the connection and the client
+//     sees a broken response rather than a truncated one that looks
+//     complete. http.ErrAbortHandler from next passes through unreported.
 //   - An incoming W3C traceparent header is extracted (unless you set a
 //     global propagator yourself, which is then used), so logs written with
 //     r.Context() carry the caller's trace and span ids.
@@ -59,7 +62,13 @@ func Middleware(next http.Handler) http.Handler {
 				return func() error { committed = true; return f() }
 			},
 			Hijack: func(f httpsnoop.HijackFunc) httpsnoop.HijackFunc {
-				return func() (net.Conn, *bufio.ReadWriter, error) { committed = true; return f() }
+				return func() (net.Conn, *bufio.ReadWriter, error) {
+					conn, rw, err := f()
+					if err == nil {
+						committed = true
+					}
+					return conn, rw, err
+				}
 			},
 		})
 		defer func() {
@@ -78,9 +87,10 @@ func Middleware(next http.Handler) http.Handler {
 				attrs = append(attrs, slog.String("http.route", route))
 			}
 			capturePanic(r.Context(), slog.LevelError, v, attrs...)
-			if !committed {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			if committed {
+				panic(http.ErrAbortHandler)
 			}
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		}()
 		next.ServeHTTP(w, r)
 	})

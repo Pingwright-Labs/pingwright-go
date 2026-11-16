@@ -19,16 +19,29 @@ import (
 // exception.type is the Go type (%T) of the innermost error under pure
 // wrappers (fmt.Errorf %w, errors.Join, *url.Error, github.com/pkg/errors),
 // so fmt.Errorf("fetch: %w", opErr) is reported as *net.OpError.
-// exception.message is err.Error(). attrs are added to the record.
+// exception.message is err.Error(), or the type when Error panics (as it
+// does for a typed nil pointer). attrs are added to the record.
 //
 // The trace and span ids in ctx, if any, are attached. A nil err does
-// nothing. CaptureError never panics on a nil ctx.
+// nothing. CaptureError never panics, also not on a nil ctx.
 func CaptureError(ctx context.Context, err error, attrs ...slog.Attr) {
 	if err == nil {
 		return
 	}
+	defer func() { _ = recover() }()
 	frames := callers(0)
-	emit(ctx, slog.LevelError, err.Error(), exceptionType(err), err.Error(), formatStack(frames), topPC(frames), attrs)
+	msg := errorText(err)
+	emit(ctx, slog.LevelError, msg, exceptionType(err), msg, formatStack(frames), topPC(frames), attrs)
+}
+
+// errorText is err.Error(), or err's type when Error panics.
+func errorText(err error) (s string) {
+	defer func() {
+		if recover() != nil {
+			s = fmt.Sprintf("%T", err)
+		}
+	}()
+	return err.Error()
 }
 
 // Recover reports a panic as an error event at FATAL, flushes it, and
@@ -59,9 +72,10 @@ func Recover(ctx context.Context) {
 
 // capturePanic must be called from the deferred function that recovered.
 func capturePanic(ctx context.Context, level slog.Level, v any, attrs ...slog.Attr) {
+	defer func() { _ = recover() }()
 	typ, msg := fmt.Sprintf("%T", v), fmt.Sprint(v)
 	if err, ok := v.(error); ok {
-		typ, msg = exceptionType(err), err.Error()
+		typ, msg = exceptionType(err), errorText(err)
 	}
 	frames := panicFrames(callers(0))
 	emit(ctx, level, "panic: "+msg, typ, msg, formatStack(frames), topPC(frames), attrs)
@@ -72,22 +86,34 @@ func emit(ctx context.Context, level slog.Level, body, typ, msg, stack string, p
 		ctx = context.Background()
 	}
 	c := active()
-	h := c.errHandler
-	if !h.Enabled(ctx, level) {
+	local := c.local.Enabled(ctx, level)
+	export := c.errExport != nil && c.errExport.Enabled(ctx, level)
+	if !local && !export {
 		return
 	}
-	r := slog.NewRecord(time.Now(), level, body, pc)
-	if c.exceptions {
-		r.AddAttrs(
-			slog.String("exception.type", typ),
-			slog.String("exception.message", msg),
-			slog.String("exception.stacktrace", stack),
-		)
-	} else {
-		r.AddAttrs(slog.String("error.type", typ))
+	now := time.Now()
+	full := slog.NewRecord(now, level, body, pc)
+	full.AddAttrs(
+		slog.String("exception.type", typ),
+		slog.String("exception.message", msg),
+		slog.String("exception.stacktrace", stack),
+	)
+	full.AddAttrs(attrs...)
+	if local {
+		_ = c.local.Handle(ctx, full.Clone())
 	}
-	r.AddAttrs(attrs...)
-	_ = h.Handle(ctx, r)
+	if !export {
+		return
+	}
+	if c.exceptions {
+		_ = c.errExport.Handle(ctx, full)
+		return
+	}
+	// DisableErrors: a plain error log, so no issue is made.
+	plain := slog.NewRecord(now, level, body, pc)
+	plain.AddAttrs(slog.String("error.type", typ))
+	plain.AddAttrs(attrs...)
+	_ = c.errExport.Handle(ctx, plain)
 }
 
 // wrapperTypes add context to an error message but say nothing about what

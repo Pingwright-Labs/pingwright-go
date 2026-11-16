@@ -350,17 +350,24 @@ func TestMiddlewarePanicReturns500(t *testing.T) {
 	}
 }
 
-func TestMiddlewarePanicAfterWrite(t *testing.T) {
-	_, _ = start(t, newCollector(t), pingwright.Options{DisableMetrics: true})
+func TestMiddlewarePanicAfterWriteAborts(t *testing.T) {
+	c := newCollector(t)
+	shutdown, _ := start(t, c, pingwright.Options{DisableMetrics: true})
 	h := pingwright.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		panic("late")
 	}))
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rr.Code != http.StatusAccepted {
-		t.Errorf("status = %d, want the already written 202", rr.Code)
+	var got any
+	func() {
+		defer func() { got = recover() }()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+	if got != http.ErrAbortHandler {
+		t.Errorf("panicked with %v, want http.ErrAbortHandler", got)
 	}
+	_ = shutdown(ctx)
+	c.Record(t, "panic: late")
 }
 
 func TestMetricsArrive(t *testing.T) {
@@ -510,8 +517,13 @@ func TestInvalidConfig(t *testing.T) {
 	t.Setenv("PINGWRIGHT_KEY", "")
 	t.Setenv("PINGWRIGHT_ENDPOINT", "")
 	for name, opts := range map[string]pingwright.Options{
-		"bad key":      {Key: "sk_live_nope"},
-		"bad endpoint": {Key: testKey, Endpoint: "ftp://x"},
+		"blank key":       {Key: "  \n"},
+		"key with space":  {Key: "pwi_abc def"},
+		"key with ctrl":   {Key: "pwi_abc\x00def"},
+		"bad endpoint":    {Key: testKey, Endpoint: "ftp://x"},
+		"no host":         {Key: testKey, Endpoint: "https://"},
+		"unparsable":      {Key: testKey, Endpoint: "http://[::1"},
+		"userinfo scheme": {Key: testKey, Endpoint: "ftp://user:secret@x"},
 	} {
 		s, err := pingwright.Init(ctx, opts)
 		if err == nil {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/Pingwright-Labs/pingwright-go"
 )
@@ -21,7 +22,11 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer shutdown(context.Background())
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdown(ctx)
+	}()
 	defer pingwright.Recover(ctx)
 
 	slog.Info("started", "port", 8080)
