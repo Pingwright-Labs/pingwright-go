@@ -199,7 +199,7 @@ func Init(ctx context.Context, opts Options) (shutdown func(context.Context) err
 	}
 
 	level := opts.LogLevel
-	if level == nil {
+	if isNilLeveler(level) {
 		level = slog.LevelInfo
 	}
 	local := localHandler(opts, level)
@@ -451,4 +451,14 @@ func firstNonEmpty(s ...string) string {
 		}
 	}
 	return ""
+}
+
+// isNilLeveler reports whether l is nil, including a typed nil such as a
+// nil *slog.LevelVar, which would panic when its level is read.
+func isNilLeveler(l slog.Leveler) bool {
+	if l == nil {
+		return true
+	}
+	v, ok := l.(*slog.LevelVar)
+	return ok && v == nil
 }
